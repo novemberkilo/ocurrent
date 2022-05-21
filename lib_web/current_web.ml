@@ -47,6 +47,7 @@ let routes engine =
     s "metrics" /? nil @--> metrics ~engine;
     s "set" / s "confirm" /? nil @--> set_confirm ~engine;
     s "jobs" /? nil @--> Jobs.r;
+    s "jobs" / s "rebuild" /? nil @--> Jobs.s ~engine;
     s "logout" /? nil @--> Resource.logout;
     s "css" / s "ansi.css" /? nil @--> Resource.static ~content_type:"text/css" Ansi.css;
     s "css" / str /? nil @--> Resource.crunch ~content_type:"text/css";
