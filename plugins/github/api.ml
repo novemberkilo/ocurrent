@@ -30,23 +30,82 @@ let lookup_actions ~engine job_id =
        method rebuild = None
      end
 
+type db_t = {
+  db : Sqlite3.db;
+  get_job_ids : Sqlite3.stmt;
+}
+
+let or_fail label x =
+  match x with
+  | Sqlite3.Rc.OK -> ()
+  | err -> Fmt.failwith "Sqlite3 %s error: %s" label (Sqlite3.Rc.to_string err)
+
+let db = lazy (
+  let db = Lazy.force Current.Db.v in
+  Current_cache.Db.init ();
+  Sqlite3.exec db {|
+CREATE TABLE IF NOT EXISTS ci_build_index (
+  owner     TEXT NOT NULL,
+  name      TEXT NOT NULL,
+  hash      TEXT NOT NULL,
+  variant   TEXT NOT NULL,
+  job_id    TEXT,
+  PRIMARY KEY (owner, name, hash, variant)
+)|} |> or_fail "create table";
+  let get_job_ids = Sqlite3.prepare db "SELECT variant, job_id FROM ci_build_index \
+                                     WHERE owner = ? AND name = ? AND hash = ?" in
+      {
+        db;
+        get_job_ids;
+      }
+)
+
+let get_job_ids t ~owner ~name ~hash =
+  Current.Db.query t.get_job_ids Sqlite3.Data.[ TEXT owner; TEXT name; TEXT hash ]
+  |> List.filter_map @@ function
+  | Sqlite3.Data.[ TEXT _variant; NULL] -> None
+  | Sqlite3.Data.[ TEXT _variant; TEXT id ] -> Some id
+  | row -> Fmt.failwith "get_job_ids: invalid row %a" Current.Db.dump_row row
+
 let rebuild_webhook ~engine ~has_role json =
   let job_id = Yojson.Safe.Util.(json |> member "check_run" |> member "external_id" |> to_string) in
   let action = Yojson.Safe.Util.(json |> member "action" |> to_string) in
   let requester = Yojson.Safe.Util.(json |> member "sender" |> member "login" |> to_string
                                     |> (fun x -> Current_web.User.v_exn @@ "github:" ^ x)) in
-  Log.info (fun f -> f "rebuild_webhook %s %s triggered by %s" action job_id (Current_web.User.id requester));
+  let commit = Yojson.Safe.Util.(json |> member "check_run" |> member "head_sha" |> to_string) in
+  let full_name = Yojson.Safe.Util.(json |> member "repository" |> member "full_name" |> to_string) in
+
+  Log.info (fun f -> f "rebuild_webhook %s external_id: %s, commit: %s, owner/name: %s -- triggered by %s" action job_id commit full_name (Current_web.User.id requester));
   match (action, has_role (Some requester) `Builder) with
   | ("rerequested", true) -> begin
       let actions = lookup_actions ~engine job_id in
       match actions#rebuild with
-      | None ->
-         Log.info (fun f -> f "not rebuilding");
-         ()
       | Some rebuild ->
-         let new_job_id = rebuild () in
-         Log.info (fun f -> f "rebuilding new_job_id %s" new_job_id);
-         ()
+        let new_job_id = rebuild () in
+        Log.info (fun f -> f "rebuilding new_job_id %s" new_job_id);
+        ()
+      | None ->
+         (*Try rebuilding the entire commit*)
+        let owner_name =
+          match String.split_on_char '/' full_name with
+          | owner :: name :: _ -> Some (owner, name)
+          | _ -> None
+        in
+        match owner_name with
+        | None ->
+          Log.warn (fun f -> f "Could not parse %s" full_name); ()
+        | Some (owner, name) ->
+          let t = Lazy.force db in
+          let job_ids = get_job_ids t ~owner ~name ~hash:commit in
+          List.iter (fun job_id ->
+          let actions = lookup_actions ~engine job_id in
+          match actions#rebuild with
+          | None -> Log.info (fun f -> f "Not rebuilding job_id: %s" job_id)
+          | Some rebuild ->
+            let new_job_id = rebuild () in
+            Log.info (fun f -> f "rebuilding new_job_id %s" new_job_id);
+            ()
+          ) job_ids
     end
   | _ -> ()
 
@@ -670,10 +729,10 @@ let head_of t repo (id: Ref.id) =
   |> Current.Primitive.map_result @@ function
   | Error _ as e -> e
   | Ok refs ->
-    Ref_map.fold (fun ref value acc -> 
-      match id, ref with 
+    Ref_map.fold (fun ref value acc ->
+      match id, ref with
       | `Ref a, `Ref b when String.equal a b -> Some value
-      | `PR (id_a: int), `PR {Ref.id;_} when id_a = id -> Some value 
+      | `PR (id_a: int), `PR {Ref.id;_} when id_a = id -> Some value
       | _ -> acc) refs.all_refs None
     |> function
     | Some x -> Ok x
